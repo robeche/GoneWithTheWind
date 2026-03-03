@@ -1,0 +1,617 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>WTG Sim - Solo Cliente</title>
+  <style>
+    html, body {
+      margin: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: #a8acc4;
+      font-family: Segoe UI, Arial, sans-serif;
+    }
+    #hud {
+      position: fixed;
+      top: 16px;
+      right: 18px;
+      color: #000;
+      font-size: 26px;
+      text-shadow: 0 1px 2px rgba(0, 0, 0, 0.4);
+      user-select: none;
+      z-index: 10;
+    }
+    #bladeDistance {
+      position: fixed;
+      top: 52px;
+      right: 18px;
+      color: #000000;
+      font-size: 18px;
+      text-shadow: 0 1px 2px rgba(0, 0, 0, 0.45);
+      user-select: none;
+      z-index: 10;
+      display: none;
+    }
+    #help {
+      position: fixed;
+      left: 16px;
+      bottom: 14px;
+      color: #000000;
+      font-size: 14px;
+      line-height: 1.45;
+      text-shadow: 0 1px 2px rgba(0, 0, 0, 0.35);
+      user-select: none;
+      z-index: 10;
+    }
+    #resetBtn {
+      position: fixed;
+      top: 16px;
+      left: 16px;
+      z-index: 11;
+      border: 0;
+      border-radius: 8px;
+      padding: 10px 14px;
+      font-size: 14px;
+      font-weight: 600;
+      color: #1e2432;
+      background: #f0f3ff;
+      cursor: pointer;
+      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
+    }
+    #resetBtn:hover {
+      background: #ffffff;
+    }
+  </style>
+</head>
+<body>
+  <button id="resetBtn" type="button">Reset</button>
+  <div id="hud">RPM: 0.00 | Ref: 0.00</div>
+  <div id="bladeDistance"></div>
+  <div id="help">↑/↓: change RPM setpoint · Space: detach highlighted blade · Mouse: orbit/zoom</div>
+
+  <script src="https://unpkg.com/three@0.128.0/build/three.min.js"></script>
+  <script src="https://unpkg.com/cannon@0.6.2/build/cannon.min.js"></script>
+  <script>
+    if (typeof THREE === 'undefined') {
+      document.getElementById('hud').textContent = 'Error: failed to load Three.js';
+      document.getElementById('help').textContent = 'Check internet access or CDN availability.';
+      throw new Error('Three.js no disponible');
+    }
+    if (typeof CANNON === 'undefined') {
+      document.getElementById('hud').textContent = 'Error: failed to load cannon.js';
+      document.getElementById('help').textContent = 'Check internet access or CDN availability.';
+      throw new Error('Cannon.js no disponible');
+    }
+
+    // ------------------------- Parámetros físicos -------------------------
+    const HUB_HEIGHT = 100.0;
+    const HUB_RADIUS = 4.0;
+    const BLADE_LENGTH = 75.0;
+    const BLADE_MASS = 25000.0;
+    const GRAVITY_ACC = 9.81;
+    const BLADE_COM_RADIUS = HUB_RADIUS + BLADE_LENGTH * 0.5;
+    const N_BLADES = 3;
+    const R_GYR = 0.55 * BLADE_LENGTH;
+    const HUB_Y = -5.0;
+
+    const J_3_BLADES = N_BLADES * BLADE_MASS * (R_GYR ** 2);
+    const J_2_BLADES = 2.0 * BLADE_MASS * (R_GYR ** 2);
+    const DAMPING = 7_500_000.0;
+
+    const RPM_SETPOINT_MIN = 0.0;
+    const RPM_SETPOINT_MAX = 14.0;
+    const RPM_SETPOINT_RATE = 1.2;
+
+    const KP_SPEED = 15_000_000.0;
+    const KI_SPEED = 1_500_000.0;
+    const TORQUE_RATE = 2_000_000.0;
+    const TORQUE_LIMIT = 12_000_000.0;
+    const BRAKE_TORQUE = 1_200_000.0;
+    const STOP_OMEGA_EPS = 0.003;
+
+    const REACTION_TORQUE_PULSE = -2_000_000.0;
+    const REACTION_TAU = 0.35;
+    const DETACH_BLADE_IDX = 0;
+    const AERO_DRAG_COEFF = 1_600_000.0;
+
+    const SIM_DT = 1 / 120;
+
+    // ------------------------- Estado de simulación -----------------------
+    const state = {
+      angle: 0,
+      omega: 0,
+      torqueCmd: 0,
+      speedRefRpm: 0,
+      speedIntError: 0,
+      disturbanceTorque: 0,
+      bladeDistanceCurrent: 0,
+      bladeDistanceMax: 0,
+      bladeDistanceFinal: null,
+      inertia: J_3_BLADES,
+      bladeReleased: false,
+      blade: {
+        detached: false,
+        px: 0,
+        py: HUB_HEIGHT,
+        pz: HUB_Y,
+      },
+    };
+
+    const keys = { up: false, down: false };
+
+    function rotateAboutZ(vec, angleRad) {
+      const [x, y, z] = vec;
+      const c = Math.cos(angleRad);
+      const s = Math.sin(angleRad);
+      return [x * c - y * s, x * s + y * c, z];
+    }
+
+    function clamp(v, lo, hi) {
+      return Math.max(lo, Math.min(hi, v));
+    }
+
+    function detachBlade() {
+      if (state.bladeReleased) return;
+
+      const phi = DETACH_BLADE_IDX * 2 * Math.PI / 3;
+      const radius = HUB_RADIUS + BLADE_LENGTH * 0.5;
+      let localCenter = [0, radius, 0];
+      localCenter = rotateAboutZ(localCenter, phi);
+      const rWorld = rotateAboutZ(localCenter, state.angle);
+
+      state.blade.detached = true;
+      state.blade.px = rWorld[0];
+      state.blade.py = HUB_HEIGHT + rWorld[1];
+      state.blade.pz = HUB_Y + rWorld[2];
+
+      const omegaVec = [0, 0, state.omega];
+      const tangential = [
+        omegaVec[1] * rWorld[2] - omegaVec[2] * rWorld[1],
+        omegaVec[2] * rWorld[0] - omegaVec[0] * rWorld[2],
+        omegaVec[0] * rWorld[1] - omegaVec[1] * rWorld[0],
+      ];
+
+      state.bladeReleased = true;
+      state.inertia = J_2_BLADES;
+      state.torqueCmd = 0;
+      state.speedIntError = 0;
+      state.speedRefRpm = 0;
+      state.disturbanceTorque += REACTION_TORQUE_PULSE;
+
+      const bladeShape = new CANNON.Box(new CANNON.Vec3(0.45, BLADE_LENGTH * 0.5, 2.1));
+      detachedBody = new CANNON.Body({ mass: BLADE_MASS, shape: bladeShape, material: bladeMat });
+      detachedBody.position.set(state.blade.px, state.blade.py, state.blade.pz);
+
+      const bladeWorldAngle = state.angle - phi;
+      detachedBody.quaternion.setFromAxisAngle(new CANNON.Vec3(0, 0, 1), bladeWorldAngle);
+
+      detachedBody.velocity.set(1.04 * tangential[0], 1.04 * tangential[1], 1.04 * tangential[2]);
+      detachedBody.angularVelocity.set(0, 0, state.omega);
+      detachedBody.angularDamping = 0.15;
+
+      world.addBody(detachedBody);
+    }
+
+    function stepSim(dt) {
+      if (!state.bladeReleased) {
+        if (keys.up && !keys.down) {
+          state.speedRefRpm = clamp(state.speedRefRpm + RPM_SETPOINT_RATE * dt, RPM_SETPOINT_MIN, RPM_SETPOINT_MAX);
+        } else if (keys.down && !keys.up) {
+          state.speedRefRpm = clamp(state.speedRefRpm - RPM_SETPOINT_RATE * dt, RPM_SETPOINT_MIN, RPM_SETPOINT_MAX);
+        }
+
+        const speedRef = state.speedRefRpm * (2 * Math.PI / 60);
+        const speedErr = speedRef - state.omega;
+        state.speedIntError = clamp(state.speedIntError + speedErr * dt, -30, 30);
+
+        let torqueTarget = KP_SPEED * speedErr + KI_SPEED * state.speedIntError;
+        torqueTarget = clamp(torqueTarget, -TORQUE_LIMIT, TORQUE_LIMIT);
+
+        const maxDeltaTorque = TORQUE_RATE * dt;
+        const deltaTorque = clamp(torqueTarget - state.torqueCmd, -maxDeltaTorque, maxDeltaTorque);
+        state.torqueCmd += deltaTorque;
+      } else {
+        state.speedRefRpm = 0;
+        state.speedIntError = 0;
+        state.torqueCmd = 0;
+      }
+
+      state.disturbanceTorque += (-state.disturbanceTorque / REACTION_TAU) * dt;
+
+      state.torqueCmd = clamp(state.torqueCmd, -TORQUE_LIMIT, TORQUE_LIMIT);
+
+      const brakeTorque = state.bladeReleased && Math.abs(state.omega) > STOP_OMEGA_EPS
+        ? -Math.sign(state.omega) * BRAKE_TORQUE
+        : 0;
+
+      let gravityTorque = 0;
+      for (let i = 0; i < N_BLADES; i += 1) {
+        if (state.bladeReleased && i === DETACH_BLADE_IDX) continue;
+        const phi = i * 2 * Math.PI / 3;
+        const bladeAngle = state.angle + phi;
+        gravityTorque += BLADE_MASS * GRAVITY_ACC * BLADE_COM_RADIUS * Math.sin(bladeAngle);
+      }
+
+      const aeroDragTorque = AERO_DRAG_COEFF * state.omega * Math.abs(state.omega);
+      const netTorque = state.torqueCmd + state.disturbanceTorque + brakeTorque + gravityTorque;
+      const alpha = (netTorque - DAMPING * state.omega - aeroDragTorque) / state.inertia;
+      state.omega += alpha * dt;
+      state.angle += state.omega * dt;
+
+    }
+
+    // ------------------------- Escena Three.js ----------------------------
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0xa8acc4);
+
+    function createCloudTexture() {
+      const canvas = document.createElement('canvas');
+      canvas.width = 256;
+      canvas.height = 256;
+      const ctx = canvas.getContext('2d');
+
+      const grad = ctx.createRadialGradient(128, 128, 18, 128, 128, 118);
+      grad.addColorStop(0.0, 'rgba(255,255,255,0.92)');
+      grad.addColorStop(0.5, 'rgba(255,255,255,0.55)');
+      grad.addColorStop(1.0, 'rgba(255,255,255,0.0)');
+      ctx.fillStyle = grad;
+      ctx.fillRect(0, 0, 256, 256);
+
+      const texture = new THREE.CanvasTexture(canvas);
+      texture.needsUpdate = true;
+      return texture;
+    }
+
+    function addCloudBackdrop() {
+      const cloudTexture = createCloudTexture();
+      const cloudGroup = new THREE.Group();
+
+      for (let i = 0; i < 40; i += 1) {
+        const material = new THREE.SpriteMaterial({
+          map: cloudTexture,
+          transparent: true,
+          opacity: 0.45 + Math.random() * 0.25,
+          depthWrite: false,
+        });
+        const cloud = new THREE.Sprite(material);
+
+        const radius = 350 + Math.random() * 420;
+        const angle = Math.random() * Math.PI * 2;
+        const height = 150 + Math.random() * 260;
+        cloud.position.set(radius * Math.cos(angle), height, radius * Math.sin(angle));
+
+        const size = 120 + Math.random() * 210;
+        cloud.scale.set(size, size * (0.55 + Math.random() * 0.35), 1);
+        cloudGroup.add(cloud);
+      }
+
+      scene.add(cloudGroup);
+    }
+
+    const camera = new THREE.PerspectiveCamera(52, window.innerWidth / window.innerHeight, 0.1, 3000);
+    camera.position.set(40, 175, -250);
+    camera.lookAt(0, HUB_HEIGHT, HUB_Y);
+
+    const orbit = {
+      target: new THREE.Vector3(0, HUB_HEIGHT, HUB_Y),
+      radius: 280,
+      azimuth: 0,
+      polar: 1.0,
+      dragging: false,
+      lastX: 0,
+      lastY: 0,
+      rotSpeed: 0.004,
+      zoomSpeed: 0.0012,
+      minRadius: 60,
+      maxRadius: 1200,
+      minPolar: 0.08,
+      maxPolar: Math.PI - 0.08,
+    };
+
+    function clamp01(v, lo, hi) {
+      return Math.max(lo, Math.min(hi, v));
+    }
+
+    function syncOrbitFromCamera() {
+      const rel = camera.position.clone().sub(orbit.target);
+      orbit.radius = rel.length();
+      orbit.azimuth = Math.atan2(rel.x, rel.z);
+      const yRatio = rel.y / Math.max(orbit.radius, 1e-6);
+      orbit.polar = Math.acos(clamp01(yRatio, -1, 1));
+    }
+
+    function updateCameraFromOrbit() {
+      const sinP = Math.sin(orbit.polar);
+      const x = orbit.radius * sinP * Math.sin(orbit.azimuth);
+      const y = orbit.radius * Math.cos(orbit.polar);
+      const z = orbit.radius * sinP * Math.cos(orbit.azimuth);
+      camera.position.set(orbit.target.x + x, orbit.target.y + y, orbit.target.z + z);
+      camera.lookAt(orbit.target);
+    }
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    document.body.appendChild(renderer.domElement);
+
+    syncOrbitFromCamera();
+
+    renderer.domElement.addEventListener('mousedown', (e) => {
+      if (e.button !== 0) return;
+      orbit.dragging = true;
+      orbit.lastX = e.clientX;
+      orbit.lastY = e.clientY;
+    });
+
+    window.addEventListener('mousemove', (e) => {
+      if (!orbit.dragging) return;
+      const dx = e.clientX - orbit.lastX;
+      const dy = e.clientY - orbit.lastY;
+      orbit.lastX = e.clientX;
+      orbit.lastY = e.clientY;
+
+      orbit.azimuth -= dx * orbit.rotSpeed;
+      orbit.polar -= dy * orbit.rotSpeed;
+      orbit.polar = clamp01(orbit.polar, orbit.minPolar, orbit.maxPolar);
+      updateCameraFromOrbit();
+    });
+
+    window.addEventListener('mouseup', () => {
+      orbit.dragging = false;
+    });
+
+    renderer.domElement.addEventListener('wheel', (e) => {
+      e.preventDefault();
+      orbit.radius *= Math.exp(e.deltaY * orbit.zoomSpeed);
+      orbit.radius = clamp01(orbit.radius, orbit.minRadius, orbit.maxRadius);
+      updateCameraFromOrbit();
+    }, { passive: false });
+
+    renderer.domElement.addEventListener('contextmenu', (e) => {
+      e.preventDefault();
+    });
+
+    scene.add(new THREE.HemisphereLight(0xf6f7ff, 0x58637c, 1.0));
+    const sun = new THREE.DirectionalLight(0xffffff, 0.8);
+    sun.position.set(130, 190, 80);
+    scene.add(sun);
+
+    addCloudBackdrop();
+
+    const ground = new THREE.Mesh(
+      new THREE.PlaneGeometry(1200, 1200),
+      new THREE.MeshStandardMaterial({ color: 0x6da05c, roughness: 0.95, metalness: 0.0 })
+    );
+    ground.rotation.x = -Math.PI / 2;
+    scene.add(ground);
+
+    const world = new CANNON.World();
+    world.gravity.set(0, -9.81, 0);
+    world.broadphase = new CANNON.NaiveBroadphase();
+    world.solver.iterations = 12;
+
+    const groundMat = new CANNON.Material('ground');
+    const bladeMat = new CANNON.Material('blade');
+    const contactMat = new CANNON.ContactMaterial(groundMat, bladeMat, {
+      friction: 0.55,
+      restitution: 0.18,
+    });
+    world.addContactMaterial(contactMat);
+
+    const groundBody = new CANNON.Body({ mass: 0, material: groundMat });
+    groundBody.addShape(new CANNON.Plane());
+    groundBody.quaternion.setFromEuler(-Math.PI / 2, 0, 0);
+    world.addBody(groundBody);
+
+    let detachedBody = null;
+
+    function makeRing(radius) {
+      const pts = [];
+      const segs = 140;
+      for (let i = 0; i <= segs; i += 1) {
+        const a = (2 * Math.PI * i) / segs;
+        pts.push(new THREE.Vector3(radius * Math.cos(a), radius * Math.sin(a), 0.0));
+      }
+      const g = new THREE.BufferGeometry().setFromPoints(pts);
+      const m = new THREE.LineBasicMaterial({ color: 0x000000, transparent: true, opacity: 0.9, depthTest: true });
+      const line = new THREE.Line(g, m);
+      line.rotation.x = Math.PI / 2;
+      line.position.y = 0.18;
+      return line;
+    }
+
+    function makeDistanceLabel(text) {
+      const canvas = document.createElement('canvas');
+      canvas.width = 256;
+      canvas.height = 96;
+      const ctx = canvas.getContext('2d');
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.fillStyle = '#000000';
+      ctx.font = 'bold 42px Segoe UI, Arial, sans-serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(text, canvas.width / 2, canvas.height / 2);
+
+      const texture = new THREE.CanvasTexture(canvas);
+      texture.needsUpdate = true;
+      const material = new THREE.SpriteMaterial({ map: texture, transparent: true, depthTest: true });
+      const sprite = new THREE.Sprite(material);
+      sprite.scale.set(18, 6.5, 1);
+      return sprite;
+    }
+
+    const ringRadii = [25, 50, 75, 100, 125, 150, 175, 200, 250, 300, 350, 400];
+    ringRadii.forEach((r) => {
+      scene.add(makeRing(r));
+      const label = makeDistanceLabel(`${r} m`);
+      label.position.set(r, 0.6, 0);
+      scene.add(label);
+    });
+
+    const tower = new THREE.Mesh(
+      new THREE.CylinderGeometry(4.2, 4.2, HUB_HEIGHT, 28),
+      new THREE.MeshStandardMaterial({ color: 0xd8dbe2 })
+    );
+    tower.position.set(0, HUB_HEIGHT * 0.5, 0);
+    scene.add(tower);
+
+    const nacelle = new THREE.Mesh(
+      new THREE.BoxGeometry(8.0, 9.0, 16.0),
+      new THREE.MeshStandardMaterial({ color: 0xbac0cf })
+    );
+    nacelle.position.set(0, HUB_HEIGHT, 4.0);
+    scene.add(nacelle);
+
+    const hubGroup = new THREE.Group();
+    hubGroup.position.set(0, HUB_HEIGHT, HUB_Y);
+    scene.add(hubGroup);
+
+    const hub = new THREE.Mesh(
+      new THREE.SphereGeometry(HUB_RADIUS, 24, 20),
+      new THREE.MeshStandardMaterial({ color: 0x9ca3b4 })
+    );
+    hubGroup.add(hub);
+
+    const bladeGeo = new THREE.BoxGeometry(0.9, BLADE_LENGTH, 4.2);
+    const bladeMats = [
+      new THREE.MeshStandardMaterial({ color: 0xf24c41 }),
+      new THREE.MeshStandardMaterial({ color: 0xf0f2f8 }),
+      new THREE.MeshStandardMaterial({ color: 0xf0f2f8 }),
+    ];
+
+    const blades = [];
+    for (let i = 0; i < 3; i += 1) {
+      const blade = new THREE.Mesh(bladeGeo, bladeMats[i]);
+      const phi = i * 2 * Math.PI / 3;
+      const radius = HUB_RADIUS + BLADE_LENGTH * 0.5;
+      blade.position.set(radius * Math.sin(phi), radius * Math.cos(phi), 0);
+      blade.rotation.z = -phi;
+      hubGroup.add(blade);
+      blades.push(blade);
+    }
+
+    const detachedBlade = new THREE.Mesh(
+      bladeGeo,
+      new THREE.MeshStandardMaterial({ color: 0xf2b244 })
+    );
+    detachedBlade.visible = false;
+    scene.add(detachedBlade);
+
+    const hud = document.getElementById('hud');
+    const bladeDistance = document.getElementById('bladeDistance');
+    const resetBtn = document.getElementById('resetBtn');
+
+    function resetSimulation() {
+      if (detachedBody) {
+        world.removeBody(detachedBody);
+        detachedBody = null;
+      }
+
+      state.angle = 0;
+      state.omega = 0;
+      state.torqueCmd = 0;
+      state.speedRefRpm = 0;
+      state.speedIntError = 0;
+      state.disturbanceTorque = 0;
+      state.bladeDistanceCurrent = 0;
+      state.bladeDistanceMax = 0;
+      state.bladeDistanceFinal = null;
+      state.inertia = J_3_BLADES;
+      state.bladeReleased = false;
+      state.blade.detached = false;
+      state.blade.px = 0;
+      state.blade.py = HUB_HEIGHT;
+      state.blade.pz = HUB_Y;
+
+      keys.up = false;
+      keys.down = false;
+
+      blades[DETACH_BLADE_IDX].visible = true;
+      detachedBlade.visible = false;
+      detachedBlade.position.set(0, HUB_HEIGHT, HUB_Y);
+      detachedBlade.quaternion.set(0, 0, 0, 1);
+      hubGroup.rotation.z = 0;
+      hud.textContent = 'RPM: 0.00 | Ref: 0.00';
+      bladeDistance.style.display = 'none';
+      bladeDistance.textContent = '';
+    }
+
+    resetBtn.addEventListener('click', resetSimulation);
+
+    window.addEventListener('keydown', (e) => {
+      if (e.code === 'ArrowUp') keys.up = true;
+      if (e.code === 'ArrowDown') keys.down = true;
+      if (e.code === 'Space' && !e.repeat) detachBlade();
+    });
+
+    window.addEventListener('keyup', (e) => {
+      if (e.code === 'ArrowUp') keys.up = false;
+      if (e.code === 'ArrowDown') keys.down = false;
+    });
+
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    // ------------------------- Loop principal -----------------------------
+    const clock = new THREE.Clock();
+    let accumulator = 0;
+
+    function animate() {
+      const frameDt = Math.min(clock.getDelta(), 0.05);
+      accumulator += frameDt;
+
+      while (accumulator >= SIM_DT) {
+        stepSim(SIM_DT);
+        if (detachedBody) {
+          world.step(SIM_DT);
+        }
+        accumulator -= SIM_DT;
+      }
+
+      hubGroup.rotation.z = state.angle;
+
+      if (state.bladeReleased) {
+        blades[DETACH_BLADE_IDX].visible = false;
+        detachedBlade.visible = true;
+        if (detachedBody) {
+          detachedBlade.position.set(detachedBody.position.x, detachedBody.position.y, detachedBody.position.z);
+          detachedBlade.quaternion.set(
+            detachedBody.quaternion.x,
+            detachedBody.quaternion.y,
+            detachedBody.quaternion.z,
+            detachedBody.quaternion.w
+          );
+
+          state.bladeDistanceCurrent = Math.hypot(detachedBody.position.x, detachedBody.position.z);
+          state.bladeDistanceMax = Math.max(state.bladeDistanceMax, state.bladeDistanceCurrent);
+
+          if (state.bladeDistanceFinal === null && detachedBody.position.y <= 0.08 && detachedBody.velocity.length() < 0.35) {
+            state.bladeDistanceFinal = state.bladeDistanceCurrent;
+          }
+
+          if (state.bladeDistanceFinal !== null) {
+            bladeDistance.textContent = `Blade CoM distance: ${state.bladeDistanceFinal.toFixed(1)} m (final)`;
+          } else {
+            bladeDistance.textContent = `Blade CoM distance: ${state.bladeDistanceCurrent.toFixed(1)} m | Max: ${state.bladeDistanceMax.toFixed(1)} m`;
+          }
+          bladeDistance.style.display = 'block';
+        }
+      }
+
+      const rpm = state.omega * 60 / (2 * Math.PI);
+      const status = state.bladeReleased ? ' | BLADE DETACHED' : '';
+      hud.textContent = `RPM: ${rpm.toFixed(2)} | Ref: ${state.speedRefRpm.toFixed(2)}${status}`;
+
+      renderer.render(scene, camera);
+      requestAnimationFrame(animate);
+    }
+
+    animate();
+  </script>
+</body>
+</html>
