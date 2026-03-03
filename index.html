@@ -63,13 +63,46 @@
     #resetBtn:hover {
       background: #ffffff;
     }
+    #speedControls {
+      position: fixed;
+      right: 16px;
+      bottom: 16px;
+      z-index: 11;
+      display: none;
+      gap: 10px;
+    }
+    .speedBtn {
+      width: 52px;
+      height: 52px;
+      border: 0;
+      border-radius: 999px;
+      font-size: 30px;
+      font-weight: 700;
+      line-height: 1;
+      color: #1e2432;
+      background: #f0f3ff;
+      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
+      touch-action: none;
+    }
+    .speedBtn:active {
+      background: #ffffff;
+    }
+    @media (hover: none) and (pointer: coarse) {
+      #speedControls {
+        display: flex;
+      }
+    }
   </style>
 </head>
 <body>
   <button id="resetBtn" type="button">Reset</button>
   <div id="hud">RPM: 0.00 | Ref: 0.00</div>
   <div id="bladeDistance"></div>
-  <div id="help">↑/↓: change RPM setpoint · Space: detach highlighted blade · Mouse: orbit/zoom</div>
+  <div id="help">↑/↓: change RPM setpoint · Space: detach highlighted blade · Mouse/Touch: orbit/zoom · +/-: RPM (móvil)</div>
+  <div id="speedControls" aria-label="Controles de velocidad">
+    <button id="speedDownBtn" class="speedBtn" type="button" aria-label="Bajar velocidad">−</button>
+    <button id="speedUpBtn" class="speedBtn" type="button" aria-label="Subir velocidad">+</button>
+  </div>
 
   <script src="https://unpkg.com/three@0.128.0/build/three.min.js"></script>
   <script src="https://unpkg.com/cannon@0.6.2/build/cannon.min.js"></script>
@@ -300,8 +333,10 @@
       azimuth: 0,
       polar: 1.0,
       dragging: false,
+      touchMode: 'none',
       lastX: 0,
       lastY: 0,
+      lastTouchDistance: 0,
       rotSpeed: 0.004,
       zoomSpeed: 0.0012,
       minRadius: 60,
@@ -335,6 +370,7 @@
     renderer.setSize(window.innerWidth, window.innerHeight);
     renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     document.body.appendChild(renderer.domElement);
+    renderer.domElement.style.touchAction = 'none';
 
     syncOrbitFromCamera();
 
@@ -372,6 +408,63 @@
     renderer.domElement.addEventListener('contextmenu', (e) => {
       e.preventDefault();
     });
+
+    function touchDistance(t1, t2) {
+      return Math.hypot(t2.clientX - t1.clientX, t2.clientY - t1.clientY);
+    }
+
+    renderer.domElement.addEventListener('touchstart', (e) => {
+      if (e.touches.length === 1) {
+        orbit.touchMode = 'rotate';
+        orbit.lastX = e.touches[0].clientX;
+        orbit.lastY = e.touches[0].clientY;
+      } else if (e.touches.length >= 2) {
+        orbit.touchMode = 'pinch';
+        orbit.lastTouchDistance = touchDistance(e.touches[0], e.touches[1]);
+      }
+    }, { passive: true });
+
+    renderer.domElement.addEventListener('touchmove', (e) => {
+      if (orbit.touchMode === 'rotate' && e.touches.length === 1) {
+        e.preventDefault();
+        const x = e.touches[0].clientX;
+        const y = e.touches[0].clientY;
+        const dx = x - orbit.lastX;
+        const dy = y - orbit.lastY;
+        orbit.lastX = x;
+        orbit.lastY = y;
+
+        orbit.azimuth -= dx * orbit.rotSpeed;
+        orbit.polar -= dy * orbit.rotSpeed;
+        orbit.polar = clamp01(orbit.polar, orbit.minPolar, orbit.maxPolar);
+        updateCameraFromOrbit();
+      } else if (orbit.touchMode === 'pinch' && e.touches.length >= 2) {
+        e.preventDefault();
+        const currentDistance = touchDistance(e.touches[0], e.touches[1]);
+        if (orbit.lastTouchDistance > 0) {
+          const distanceDelta = currentDistance - orbit.lastTouchDistance;
+          orbit.radius *= Math.exp(-distanceDelta * orbit.zoomSpeed * 0.5);
+          orbit.radius = clamp01(orbit.radius, orbit.minRadius, orbit.maxRadius);
+          updateCameraFromOrbit();
+        }
+        orbit.lastTouchDistance = currentDistance;
+      }
+    }, { passive: false });
+
+    renderer.domElement.addEventListener('touchend', (e) => {
+      if (e.touches.length === 0) {
+        orbit.touchMode = 'none';
+        orbit.lastTouchDistance = 0;
+      } else if (e.touches.length === 1) {
+        orbit.touchMode = 'rotate';
+        orbit.lastX = e.touches[0].clientX;
+        orbit.lastY = e.touches[0].clientY;
+        orbit.lastTouchDistance = 0;
+      } else if (e.touches.length >= 2) {
+        orbit.touchMode = 'pinch';
+        orbit.lastTouchDistance = touchDistance(e.touches[0], e.touches[1]);
+      }
+    }, { passive: true });
 
     scene.add(new THREE.HemisphereLight(0xf6f7ff, 0x58637c, 1.0));
     const sun = new THREE.DirectionalLight(0xffffff, 0.8);
@@ -502,6 +595,29 @@
     const hud = document.getElementById('hud');
     const bladeDistance = document.getElementById('bladeDistance');
     const resetBtn = document.getElementById('resetBtn');
+    const speedUpBtn = document.getElementById('speedUpBtn');
+    const speedDownBtn = document.getElementById('speedDownBtn');
+
+    function bindHoldButton(button, keyName) {
+      const stop = () => {
+        keys[keyName] = false;
+      };
+
+      button.addEventListener('pointerdown', (e) => {
+        e.preventDefault();
+        keys[keyName] = true;
+        if (typeof button.setPointerCapture === 'function') {
+          button.setPointerCapture(e.pointerId);
+        }
+      });
+
+      button.addEventListener('pointerup', stop);
+      button.addEventListener('pointercancel', stop);
+      button.addEventListener('lostpointercapture', stop);
+    }
+
+    bindHoldButton(speedUpBtn, 'up');
+    bindHoldButton(speedDownBtn, 'down');
 
     function resetSimulation() {
       if (detachedBody) {
