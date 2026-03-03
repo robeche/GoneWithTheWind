@@ -70,6 +70,7 @@
       z-index: 11;
       display: none;
       gap: 10px;
+      align-items: center;
     }
     .speedBtn {
       width: 52px;
@@ -87,6 +88,13 @@
     .speedBtn:active {
       background: #ffffff;
     }
+    #detachBtn {
+      width: auto;
+      min-width: 74px;
+      padding: 0 14px;
+      font-size: 14px;
+      font-weight: 700;
+    }
     @media (hover: none) and (pointer: coarse) {
       #speedControls {
         display: flex;
@@ -98,10 +106,11 @@
   <button id="resetBtn" type="button">Reset</button>
   <div id="hud">RPM: 0.00 | Ref: 0.00</div>
   <div id="bladeDistance"></div>
-  <div id="help">↑/↓: change RPM setpoint · Space: detach highlighted blade · Mouse/Touch: orbit/zoom · +/-: RPM (móvil)</div>
+  <div id="help">↑/↓: change RPM setpoint · Space: detach highlighted blade · Mouse/Touch: orbit/zoom · +/-: RPM (móvil) · Pala: lanzar</div>
   <div id="speedControls" aria-label="Controles de velocidad">
     <button id="speedDownBtn" class="speedBtn" type="button" aria-label="Bajar velocidad">−</button>
     <button id="speedUpBtn" class="speedBtn" type="button" aria-label="Subir velocidad">+</button>
+    <button id="detachBtn" class="speedBtn" type="button" aria-label="Lanzar pala">Pala</button>
   </div>
 
   <script src="https://unpkg.com/three@0.128.0/build/three.min.js"></script>
@@ -597,6 +606,7 @@
     const resetBtn = document.getElementById('resetBtn');
     const speedUpBtn = document.getElementById('speedUpBtn');
     const speedDownBtn = document.getElementById('speedDownBtn');
+    const detachBtn = document.getElementById('detachBtn');
 
     function bindHoldButton(button, keyName) {
       const stop = () => {
@@ -618,6 +628,10 @@
 
     bindHoldButton(speedUpBtn, 'up');
     bindHoldButton(speedDownBtn, 'down');
+    detachBtn.addEventListener('pointerdown', (e) => {
+      e.preventDefault();
+      detachBlade();
+    });
 
     function resetSimulation() {
       if (detachedBody) {
