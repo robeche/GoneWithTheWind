@@ -95,29 +95,33 @@
       font-size: 14px;
       font-weight: 700;
     }
-    #hofPanel {
+    #hofOverlay {
       position: fixed;
-      top: 70px;
-      left: 16px;
-      width: 320px;
+      inset: 0;
+      z-index: 20;
+      display: none;
+      place-items: center;
+      background: rgba(0, 0, 0, 0.35);
+    }
+    #hofPanel {
+      width: 420px;
       max-width: calc(100vw - 32px);
-      z-index: 11;
       border-radius: 10px;
-      padding: 10px;
-      background: rgba(240, 243, 255, 0.92);
-      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
+      padding: 16px;
+      background: rgba(240, 243, 255, 0.86);
+      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.24);
       color: #1e2432;
       user-select: none;
     }
     #hofTitle {
-      font-size: 14px;
+      font-size: 18px;
       font-weight: 700;
-      margin-bottom: 8px;
+      margin-bottom: 12px;
     }
     #hofForm {
       display: flex;
-      gap: 8px;
-      margin-bottom: 8px;
+      gap: 10px;
+      margin-bottom: 10px;
     }
     #playerNameInput {
       flex: 1;
@@ -133,8 +137,8 @@
     #saveRecordBtn {
       border: 0;
       border-radius: 8px;
-      padding: 8px 10px;
-      font-size: 13px;
+      padding: 10px 12px;
+      font-size: 14px;
       font-weight: 700;
       color: #1e2432;
       background: #ffffff;
@@ -146,21 +150,33 @@
       cursor: default;
     }
     #hofStatus {
-      font-size: 12px;
+      font-size: 13px;
       line-height: 1.3;
-      margin-bottom: 8px;
-      min-height: 16px;
+      margin-bottom: 10px;
+      min-height: 18px;
     }
     #hofList {
       margin: 0;
       padding-left: 18px;
-      max-height: 180px;
+      max-height: 220px;
       overflow: auto;
-      font-size: 12px;
+      font-size: 13px;
       line-height: 1.35;
     }
     #hofList li {
       margin: 0 0 4px;
+    }
+    #tryAgainBtn {
+      width: 100%;
+      border: 0;
+      border-radius: 8px;
+      padding: 10px 12px;
+      margin-top: 10px;
+      font-size: 14px;
+      font-weight: 700;
+      color: #1e2432;
+      background: #ffffff;
+      cursor: pointer;
     }
     @media (hover: none) and (pointer: coarse) {
       #speedControls {
@@ -179,15 +195,18 @@
     <button id="speedUpBtn" class="speedBtn" type="button" aria-label="Subir velocidad">+</button>
     <button id="detachBtn" class="speedBtn" type="button" aria-label="Launch blade">Launch</button>
   </div>
-  <aside id="hofPanel" aria-label="Hall of Fame">
-    <div id="hofTitle">Hall of Fame</div>
-    <div id="hofForm">
-      <input id="playerNameInput" type="text" maxlength="24" placeholder="Your name" autocomplete="nickname" />
-      <button id="saveRecordBtn" type="button">Save</button>
-    </div>
-    <div id="hofStatus">Waiting for final distance…</div>
-    <ol id="hofList"></ol>
-  </aside>
+  <div id="hofOverlay" aria-hidden="true">
+    <aside id="hofPanel" aria-label="Hall of Fame">
+      <div id="hofTitle">Hall of Fame</div>
+      <div id="hofForm">
+        <input id="playerNameInput" type="text" maxlength="24" placeholder="Your name" autocomplete="nickname" />
+        <button id="saveRecordBtn" type="button">Accept</button>
+      </div>
+      <div id="hofStatus">Waiting for final distance…</div>
+      <ol id="hofList"></ol>
+      <button id="tryAgainBtn" type="button">Try again</button>
+    </aside>
+  </div>
 
   <script src="https://unpkg.com/three@0.128.0/build/three.min.js"></script>
   <script src="https://unpkg.com/cannon@0.6.2/build/cannon.min.js"></script>
@@ -228,7 +247,7 @@
     const RPM_SETPOINT_RATE = 1.2;
 
     const KP_SPEED = 15_000_000.0;
-    const KI_SPEED = 1_500_000.0;
+    const KI_SPEED = 4_500_000.0;
     const TORQUE_RATE = 2_000_000.0;
     const TORQUE_LIMIT = 12_000_000.0;
     const BRAKE_TORQUE = 1_200_000.0;
@@ -252,6 +271,8 @@
       bladeDistanceCurrent: 0,
       bladeDistanceMax: 0,
       bladeDistanceFinal: null,
+      bladeHasLanded: false,
+      bladeSettleTime: 0,
       inertia: J_3_BLADES,
       bladeReleased: false,
       blade: {
@@ -306,6 +327,9 @@
       const bladeShape = new CANNON.Box(new CANNON.Vec3(0.45, BLADE_LENGTH * 0.5, 2.1));
       detachedBody = new CANNON.Body({ mass: BLADE_MASS, shape: bladeShape, material: bladeMat });
       detachedBody.position.set(state.blade.px, state.blade.py, state.blade.pz);
+      detachedBody.allowSleep = true;
+      detachedBody.sleepSpeedLimit = 0.25;
+      detachedBody.sleepTimeLimit = 0.7;
 
       const bladeWorldAngle = state.angle - phi;
       detachedBody.quaternion.setFromAxisAngle(new CANNON.Vec3(0, 0, 1), bladeWorldAngle);
@@ -692,6 +716,9 @@
     const saveRecordBtn = document.getElementById('saveRecordBtn');
     const hofStatus = document.getElementById('hofStatus');
     const hofList = document.getElementById('hofList');
+    const tryAgainBtn = document.getElementById('tryAgainBtn');
+    const hofOverlay = document.getElementById('hofOverlay');
+    const hofPanel = document.getElementById('hofPanel');
 
     const hofState = {
       client: null,
@@ -705,6 +732,11 @@
       hofStatus.textContent = text;
     }
 
+    function setHofVisible(isVisible) {
+      hofOverlay.style.display = isVisible ? 'grid' : 'none';
+      hofOverlay.setAttribute('aria-hidden', isVisible ? 'false' : 'true');
+    }
+
     function renderHofList(records) {
       hofList.innerHTML = '';
       if (!records.length) {
@@ -714,11 +746,11 @@
         return;
       }
 
-      records.forEach((row, idx) => {
+      records.forEach((row) => {
         const li = document.createElement('li');
         const safeName = row.player_name || 'Anonymous';
         const distance = Number(row.distance_m || 0).toFixed(1);
-        li.textContent = `#${idx + 1} ${safeName} — ${distance} m`;
+        li.textContent = `${safeName} — ${distance} m`;
         hofList.appendChild(li);
       });
     }
@@ -783,7 +815,7 @@
       }
 
       hofState.currentRunSaved = true;
-      setHofStatus(`Saved: ${playerName} — ${hofState.pendingDistance.toFixed(1)} m`);
+      setHofStatus(`Saved: ${playerName} — ${hofState.pendingDistance.toFixed(1)} m. Press Try again to continue.`);
       await loadHofRecords();
     }
 
@@ -803,7 +835,7 @@
       hofState.enabled = true;
       setHofStatus('Loading Hall of Fame…');
       await loadHofRecords();
-      setHofStatus('Ready. Launch a blade and save your record.');
+      setHofStatus('Ready. Launch a blade to submit your record.');
     }
 
     function bindHoldButton(button, keyName) {
@@ -833,6 +865,9 @@
     saveRecordBtn.addEventListener('click', () => {
       void saveCurrentRecord();
     });
+    tryAgainBtn.addEventListener('click', () => {
+      resetSimulation();
+    });
     playerNameInput.addEventListener('keydown', (e) => {
       if (e.key === 'Enter') {
         e.preventDefault();
@@ -855,6 +890,8 @@
       state.bladeDistanceCurrent = 0;
       state.bladeDistanceMax = 0;
       state.bladeDistanceFinal = null;
+      state.bladeHasLanded = false;
+      state.bladeSettleTime = 0;
       state.inertia = J_3_BLADES;
       state.bladeReleased = false;
       state.blade.detached = false;
@@ -875,7 +912,8 @@
       hud.textContent = 'RPM: 0.00 | Ref: 0.00';
       bladeDistance.style.display = 'none';
       bladeDistance.textContent = '';
-      setHofStatus(hofState.enabled ? 'Ready. Launch a blade and save your record.' : 'Set SUPABASE_URL and SUPABASE_ANON_KEY in index.html.');
+      setHofVisible(false);
+      setHofStatus(hofState.enabled ? 'Ready. Launch a blade to submit your record.' : 'Set SUPABASE_URL and SUPABASE_ANON_KEY in index.html.');
     }
 
     resetBtn.addEventListener('click', resetSimulation);
@@ -930,14 +968,27 @@
           state.bladeDistanceCurrent = Math.hypot(detachedBody.position.x, detachedBody.position.z);
           state.bladeDistanceMax = Math.max(state.bladeDistanceMax, state.bladeDistanceCurrent);
 
-          if (state.bladeDistanceFinal === null && detachedBody.position.y <= 0.08 && detachedBody.velocity.length() < 0.35) {
+          const speed = detachedBody.velocity.length();
+          const nearGround = detachedBody.position.y <= 6.0;
+          const lowSpeed = speed <= 0.75;
+          const bodySleeping = detachedBody.sleepState === CANNON.Body.SLEEPING;
+
+          if (nearGround) {
+            state.bladeHasLanded = true;
+          }
+
+          if (state.bladeHasLanded && (lowSpeed || bodySleeping)) {
+            state.bladeSettleTime += frameDt;
+          } else {
+            state.bladeSettleTime = 0;
+          }
+
+          if (state.bladeDistanceFinal === null && state.bladeHasLanded && (bodySleeping || state.bladeSettleTime >= 0.8)) {
             state.bladeDistanceFinal = state.bladeDistanceCurrent;
             hofState.pendingDistance = state.bladeDistanceFinal;
-            if (playerNameInput.value.trim()) {
-              void saveCurrentRecord();
-            } else {
-              setHofStatus(`Final distance ${state.bladeDistanceFinal.toFixed(1)} m. Enter name and press Save.`);
-            }
+            setHofVisible(true);
+            playerNameInput.focus();
+            setHofStatus(`Final distance ${state.bladeDistanceFinal.toFixed(1)} m. Enter name and press Accept.`);
           }
 
           if (state.bladeDistanceFinal !== null) {
