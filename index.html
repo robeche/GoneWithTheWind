@@ -95,6 +95,73 @@
       font-size: 14px;
       font-weight: 700;
     }
+    #hofPanel {
+      position: fixed;
+      top: 70px;
+      left: 16px;
+      width: 320px;
+      max-width: calc(100vw - 32px);
+      z-index: 11;
+      border-radius: 10px;
+      padding: 10px;
+      background: rgba(240, 243, 255, 0.92);
+      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
+      color: #1e2432;
+      user-select: none;
+    }
+    #hofTitle {
+      font-size: 14px;
+      font-weight: 700;
+      margin-bottom: 8px;
+    }
+    #hofForm {
+      display: flex;
+      gap: 8px;
+      margin-bottom: 8px;
+    }
+    #playerNameInput {
+      flex: 1;
+      min-width: 0;
+      border: 0;
+      border-radius: 8px;
+      padding: 8px 10px;
+      font-size: 13px;
+      color: #1e2432;
+      background: #ffffff;
+      outline: none;
+    }
+    #saveRecordBtn {
+      border: 0;
+      border-radius: 8px;
+      padding: 8px 10px;
+      font-size: 13px;
+      font-weight: 700;
+      color: #1e2432;
+      background: #ffffff;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    #saveRecordBtn:disabled {
+      opacity: 0.6;
+      cursor: default;
+    }
+    #hofStatus {
+      font-size: 12px;
+      line-height: 1.3;
+      margin-bottom: 8px;
+      min-height: 16px;
+    }
+    #hofList {
+      margin: 0;
+      padding-left: 18px;
+      max-height: 180px;
+      overflow: auto;
+      font-size: 12px;
+      line-height: 1.35;
+    }
+    #hofList li {
+      margin: 0 0 4px;
+    }
     @media (hover: none) and (pointer: coarse) {
       #speedControls {
         display: flex;
@@ -112,9 +179,19 @@
     <button id="speedUpBtn" class="speedBtn" type="button" aria-label="Subir velocidad">+</button>
     <button id="detachBtn" class="speedBtn" type="button" aria-label="Launch blade">Launch</button>
   </div>
+  <aside id="hofPanel" aria-label="Hall of Fame">
+    <div id="hofTitle">Hall of Fame</div>
+    <div id="hofForm">
+      <input id="playerNameInput" type="text" maxlength="24" placeholder="Your name" autocomplete="nickname" />
+      <button id="saveRecordBtn" type="button">Save</button>
+    </div>
+    <div id="hofStatus">Waiting for final distance…</div>
+    <ol id="hofList"></ol>
+  </aside>
 
   <script src="https://unpkg.com/three@0.128.0/build/three.min.js"></script>
   <script src="https://unpkg.com/cannon@0.6.2/build/cannon.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
   <script>
     if (typeof THREE === 'undefined') {
       document.getElementById('hud').textContent = 'Error: failed to load Three.js';
@@ -126,6 +203,10 @@
       document.getElementById('help').textContent = 'Check internet access or CDN availability.';
       throw new Error('Cannon.js no disponible');
     }
+
+    const SUPABASE_URL = 'https://igyovxpibgvspltqnkel.supabase.co';
+    const SUPABASE_ANON_KEY = 'sb_publishable_h9_ah_OXwN2d5z5jnhBu7g_KhIzjvKU';
+    const HOF_TABLE = 'hall_of_fame';
 
     // ------------------------- Parámetros físicos -------------------------
     const HUB_HEIGHT = 100.0;
@@ -607,6 +688,123 @@
     const speedUpBtn = document.getElementById('speedUpBtn');
     const speedDownBtn = document.getElementById('speedDownBtn');
     const detachBtn = document.getElementById('detachBtn');
+    const playerNameInput = document.getElementById('playerNameInput');
+    const saveRecordBtn = document.getElementById('saveRecordBtn');
+    const hofStatus = document.getElementById('hofStatus');
+    const hofList = document.getElementById('hofList');
+
+    const hofState = {
+      client: null,
+      enabled: false,
+      pendingDistance: null,
+      currentRunSaved: false,
+      saving: false,
+    };
+
+    function setHofStatus(text) {
+      hofStatus.textContent = text;
+    }
+
+    function renderHofList(records) {
+      hofList.innerHTML = '';
+      if (!records.length) {
+        const li = document.createElement('li');
+        li.textContent = 'No records yet.';
+        hofList.appendChild(li);
+        return;
+      }
+
+      records.forEach((row, idx) => {
+        const li = document.createElement('li');
+        const safeName = row.player_name || 'Anonymous';
+        const distance = Number(row.distance_m || 0).toFixed(1);
+        li.textContent = `#${idx + 1} ${safeName} — ${distance} m`;
+        hofList.appendChild(li);
+      });
+    }
+
+    async function loadHofRecords() {
+      if (!hofState.enabled || !hofState.client) return;
+      const { data, error } = await hofState.client
+        .from(HOF_TABLE)
+        .select('player_name, distance_m, created_at')
+        .order('distance_m', { ascending: false })
+        .order('created_at', { ascending: true })
+        .limit(10);
+
+      if (error) {
+        setHofStatus(`Hall of Fame load error: ${error.message}`);
+        return;
+      }
+
+      renderHofList(data || []);
+    }
+
+    async function saveCurrentRecord() {
+      if (!hofState.enabled || !hofState.client) {
+        setHofStatus('Configure Supabase URL and anon key to save records.');
+        return;
+      }
+      if (hofState.pendingDistance === null) {
+        setHofStatus('No final distance yet. Launch a blade first.');
+        return;
+      }
+      if (hofState.currentRunSaved) {
+        setHofStatus('This run is already saved. Reset and launch again for a new record.');
+        return;
+      }
+      if (hofState.saving) {
+        return;
+      }
+
+      const playerName = playerNameInput.value.trim();
+      if (!playerName) {
+        setHofStatus('Enter your name to save your record.');
+        return;
+      }
+
+      hofState.saving = true;
+      saveRecordBtn.disabled = true;
+      setHofStatus('Saving record…');
+
+      const { error } = await hofState.client
+        .from(HOF_TABLE)
+        .insert({
+          player_name: playerName,
+          distance_m: Number(hofState.pendingDistance.toFixed(3)),
+        });
+
+      hofState.saving = false;
+      saveRecordBtn.disabled = false;
+
+      if (error) {
+        setHofStatus(`Save failed: ${error.message}`);
+        return;
+      }
+
+      hofState.currentRunSaved = true;
+      setHofStatus(`Saved: ${playerName} — ${hofState.pendingDistance.toFixed(1)} m`);
+      await loadHofRecords();
+    }
+
+    async function initHallOfFame() {
+      const ready = typeof window.supabase !== 'undefined'
+        && !SUPABASE_URL.includes('REPLACE_WITH_')
+        && !SUPABASE_ANON_KEY.includes('REPLACE_WITH_');
+
+      if (!ready) {
+        saveRecordBtn.disabled = false;
+        setHofStatus('Set SUPABASE_URL and SUPABASE_ANON_KEY in index.html.');
+        renderHofList([]);
+        return;
+      }
+
+      hofState.client = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+      hofState.enabled = true;
+      setHofStatus('Loading Hall of Fame…');
+      await loadHofRecords();
+      setHofStatus('Ready. Launch a blade and save your record.');
+    }
 
     function bindHoldButton(button, keyName) {
       const stop = () => {
@@ -632,6 +830,15 @@
       e.preventDefault();
       detachBlade();
     });
+    saveRecordBtn.addEventListener('click', () => {
+      void saveCurrentRecord();
+    });
+    playerNameInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        void saveCurrentRecord();
+      }
+    });
 
     function resetSimulation() {
       if (detachedBody) {
@@ -654,6 +861,8 @@
       state.blade.px = 0;
       state.blade.py = HUB_HEIGHT;
       state.blade.pz = HUB_Y;
+      hofState.pendingDistance = null;
+      hofState.currentRunSaved = false;
 
       keys.up = false;
       keys.down = false;
@@ -666,6 +875,7 @@
       hud.textContent = 'RPM: 0.00 | Ref: 0.00';
       bladeDistance.style.display = 'none';
       bladeDistance.textContent = '';
+      setHofStatus(hofState.enabled ? 'Ready. Launch a blade and save your record.' : 'Set SUPABASE_URL and SUPABASE_ANON_KEY in index.html.');
     }
 
     resetBtn.addEventListener('click', resetSimulation);
@@ -722,6 +932,12 @@
 
           if (state.bladeDistanceFinal === null && detachedBody.position.y <= 0.08 && detachedBody.velocity.length() < 0.35) {
             state.bladeDistanceFinal = state.bladeDistanceCurrent;
+            hofState.pendingDistance = state.bladeDistanceFinal;
+            if (playerNameInput.value.trim()) {
+              void saveCurrentRecord();
+            } else {
+              setHofStatus(`Final distance ${state.bladeDistanceFinal.toFixed(1)} m. Enter name and press Save.`);
+            }
           }
 
           if (state.bladeDistanceFinal !== null) {
@@ -742,6 +958,7 @@
     }
 
     animate();
+    void initHallOfFame();
   </script>
 </body>
 </html>
