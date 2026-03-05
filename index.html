@@ -247,9 +247,9 @@
     const RPM_SETPOINT_RATE = 1.2;
 
     const KP_SPEED = 15_000_000.0;
-    const KI_SPEED = 4_500_000.0;
-    const TORQUE_RATE = 2_000_000.0;
-    const TORQUE_LIMIT = 12_000_000.0;
+    const KI_SPEED = 1_400_000.0;
+    const TORQUE_RATE = 2_800_000.0;
+    const TORQUE_LIMIT = 16_000_000.0;
     const BRAKE_TORQUE = 1_200_000.0;
     const STOP_OMEGA_EPS = 0.003;
 
@@ -351,9 +351,18 @@
 
         const speedRef = state.speedRefRpm * (2 * Math.PI / 60);
         const speedErr = speedRef - state.omega;
-        state.speedIntError = clamp(state.speedIntError + speedErr * dt, -30, 30);
+        const speedIntCandidate = clamp(state.speedIntError + speedErr * dt, -10, 10);
 
-        let torqueTarget = KP_SPEED * speedErr + KI_SPEED * state.speedIntError;
+        const ffTorque = DAMPING * speedRef + AERO_DRAG_COEFF * speedRef * Math.abs(speedRef);
+        const torqueUnsatWithCandidate = ffTorque + KP_SPEED * speedErr + KI_SPEED * speedIntCandidate;
+        const saturatingHigh = torqueUnsatWithCandidate > TORQUE_LIMIT && speedErr > 0;
+        const saturatingLow = torqueUnsatWithCandidate < -TORQUE_LIMIT && speedErr < 0;
+
+        if (!(saturatingHigh || saturatingLow)) {
+          state.speedIntError = speedIntCandidate;
+        }
+
+        let torqueTarget = ffTorque + KP_SPEED * speedErr + KI_SPEED * state.speedIntError;
         torqueTarget = clamp(torqueTarget, -TORQUE_LIMIT, TORQUE_LIMIT);
 
         const maxDeltaTorque = TORQUE_RATE * dt;
